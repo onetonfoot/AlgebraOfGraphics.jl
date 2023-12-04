@@ -6,34 +6,29 @@ Base.@kwdef struct DensityAnalysis{D, K, B}
 end
 
 # Work around lack of length 1 tuple method
-# TODO: also add weights support here
 _kde(data::NTuple{1, Any}; kwargs...) = kde(data...; kwargs...)
 _kde(data::Tuple; kwargs...) = kde(data; kwargs...)
 
-function compute_datalimits(positional, datalimits)
-    return if datalimits === automatic
-        map(v -> mapreduce(extrema, extend_extrema, v), Tuple(positional))
-    else
-        datalimits
-    end
-end
+defaultdatalimits(positional) = map(nested_extrema_finite, Tuple(positional))
 
 applydatalimits(f::Function, d) = map(f, d)
-applydatalimits(limits::Union{AbstractArray, Tuple}, _) = limits
+applydatalimits(limits::Tuple, _) = limits
 
-function _density(data...; datalimits, npoints, kwargs...)
-    k = _kde(data; kwargs...)
-    es = applydatalimits(datalimits, data)
-    rgs = map(e -> range(e...; length=npoints), es)
+function _density(vs::Tuple; datalimits, npoints, kwargs...)
+    k = _kde(vs; kwargs...)
+    intervals = applydatalimits(datalimits, vs)
+    rgs = map(intervals) do (min, max)
+        return range(min, max; length=npoints)
+    end
     res = pdf(k, rgs...)
     return (rgs..., res)
 end
 
 function (d::DensityAnalysis)(input::ProcessedLayer)
-    datalimits = compute_datalimits(input.positional, d.datalimits)
+    datalimits = d.datalimits === automatic ? defaultdatalimits(input.positional) : d.datalimits
     options = valid_options(; datalimits, d.npoints, d.kernel, d.bandwidth)
     output = map(input) do p, n
-        return _density(p...; pairs(n)..., pairs(options)...), (;)
+        return _density(Tuple(p); pairs(n)..., pairs(options)...), (;)
     end
     N = length(input.positional)
     labels = set(input.labels, N+1 => "pdf")
@@ -47,8 +42,14 @@ end
     density(; datalimits=automatic, kernel=automatic, bandwidth=automatic, npoints=200)
 
 Fit a kernel density estimation of `data`.
-Here, `datalimits` specifies the range for which the density should be calculated,
-and `kernel` and `bandwidth` are forwarded to `KernelDensity.kde`.
+
+Here, `datalimits` specifies the range for which the density should be calculated
+(it defaults to the extrema of the whole data).
+The keyword argument `datalimits` can be a tuple of two values, e.g. `datalimits=(0, 10)`,
+or a function to be applied group by group, e.g. `datalimits=extrema`.
+The keyword arguments `kernel` and `bandwidth` are forwarded to `KernelDensity.kde`.
 `npoints` is the number of points used by Makie to draw the line
+
+Weighted data is supported via the keyword `weights` (passed to `mapping`).
 """
 density(; options...) = transformation(DensityAnalysis(; options...))

@@ -4,29 +4,45 @@
 Algebraic object encoding a list of [`AlgebraOfGraphics.Layer`](@ref) objects.
 `Layers` objects can be added or multiplied, yielding a novel `Layers` object.
 """
-struct Layers
+struct Layers <: AbstractAlgebraic
     layers::Vector{Layer}
 end
 
-Base.convert(::Type{Layers}, s::Layer) = Layers([s])
-Base.convert(::Type{Layers}, s::Layers) = s
+Base.convert(::Type{Layers}, l::Layer) = Layers([l])
 
-Base.getindex(v::Layers, i::Int) = v.layers[i]
-Base.length(v::Layers) = length(v.layers)
+Base.getindex(layers::Layers, i::Int) = layers.layers[i]
+Base.length(layers::Layers) = length(layers.layers)
 Base.eltype(::Type{Layers}) = Layer
-Base.iterate(v::Layers, args...) = iterate(v.layers, args...)
+Base.iterate(layers::Layers, args...) = iterate(layers.layers, args...)
 
-const OneOrMoreLayers = Union{Layers, Layer}
-
-function Base.:+(s1::OneOrMoreLayers, s2::OneOrMoreLayers)
-    l1::Layers, l2::Layers = s1, s2
-    return Layers(vcat(l1.layers, l2.layers))
+function Base.:+(a::AbstractAlgebraic, a′::AbstractAlgebraic)
+    layers::Layers, layers′::Layers = a, a′
+    return Layers(vcat(layers.layers, layers′.layers))
 end
 
-function Base.:*(s1::OneOrMoreLayers, s2::OneOrMoreLayers)
-    l1::Layers, l2::Layers = s1, s2
-    return Layers([el1 * el2 for el1 in l1 for el2 in l2])
+function Base.:*(a::AbstractAlgebraic, a′::AbstractAlgebraic)
+    layers::Layers, layers′::Layers = a, a′
+    return Layers([layer * layer′ for layer in layers for layer′ in layers′])
 end
+
+"""
+    ProcessedLayers(layers::Vector{ProcessedLayer})
+
+Object encoding a list of [`AlgebraOfGraphics.ProcessedLayer`](@ref) objects.
+`ProcessedLayers` objects are the output of the processing pipeline and can be
+drawn without further processing.
+"""
+struct ProcessedLayers <: AbstractDrawable
+    layers::Vector{ProcessedLayer}
+end
+
+function ProcessedLayers(a::AbstractAlgebraic)
+    layers::Layers = a
+    return ProcessedLayers(map(process, layers))
+end
+
+ProcessedLayers(p::ProcessedLayer) = ProcessedLayers([p])
+ProcessedLayers(p::ProcessedLayers) = p
 
 function compute_processedlayers_grid(processedlayers, categoricalscales)
     indices = CartesianIndices(compute_grid_positions(categoricalscales))
@@ -37,85 +53,65 @@ function compute_processedlayers_grid(processedlayers, categoricalscales)
     return pls_grid
 end
 
-function compute_attributes(attributes, primary, named)
-    attrs = NamedArguments()
-    merge!(attrs, attributes)
-    merge!(attrs, primary)
-    merge!(attrs, named)
-
-    # implement alpha transparency
-    alpha = get(attrs, :alpha, automatic)
-    color = get(attrs, :color, automatic)
-    (color !== automatic) && (alpha !== automatic) && (color = (color, alpha))
-
-    # opt out of the default cycling mechanism
-    cycle = nothing
-
-    merge!(attrs, Dictionary(valid_options(; color, cycle)))
-
-    # remove unnecessary information 
-    return filterkeys(!in((:col, :row, :layout, :alpha)), attrs)
-end
-
-function compute_entries_continuousscales(pls_grid)
+function compute_entries_continuousscales(pls_grid, categoricalscales)
     # Here processed layers in `pls_grid` are "sliced",
     # the categorical scales have been applied, but not
     # the continuous scales
 
-    entries_grid = map(_ -> Entry[], pls_grid)
+    rescaled_pls_grid = map(_ -> ProcessedLayer[], pls_grid)
     continuousscales_grid = map(_ -> MixedArguments(), pls_grid)
 
     for idx in eachindex(pls_grid), pl in pls_grid[idx]
         # Apply continuous transformations
         positional = map(contextfree_rescale, pl.positional)
+        named = map(contextfree_rescale, pl.named)
         plottype = Makie.plottype(pl.plottype, positional...)
 
         # Compute continuous scales with correct plottype, to figure out role of color
         continuousscales = AlgebraOfGraphics.continuousscales(ProcessedLayer(pl; plottype))
         mergewith!(mergescales, continuousscales_grid[idx], continuousscales)
 
-        # Compute `Entry` with rescaled columns
-        named = compute_attributes(pl.attributes, pl.primary, map(contextfree_rescale, pl.named))
-        entry = Entry(plottype, positional, named)
-        push!(entries_grid[idx], entry)
+        # Compute `ProcessedLayer` with rescaled columns
+        push!(rescaled_pls_grid[idx], ProcessedLayer(pl; plottype, positional, named))
     end
 
     # Compute merged continuous scales, as it may be needed to use global extrema
     merged_continuousscales = reduce(mergewith!(mergescales), continuousscales_grid, init=MixedArguments())
 
-    colorscale = get(merged_continuousscales, :color, nothing)
-    if !isnothing(colorscale)
-        # TODO: might need to change to support temporal color scale
-        colorrange = colorscale.extrema
-        for entries in entries_grid, entry in entries
-            # Safe to do, as each entry has a separate `named` dictionary
-            set!(entry.named, :colorrange, colorrange)
-        end
+    to_entry = function (pl)
+        attrs = compute_attributes(pl, categoricalscales, continuousscales_grid, merged_continuousscales)
+        return Entry(pl.plottype, pl.positional, attrs)
     end
+    entries_grid = map(pls -> map(to_entry, pls), rescaled_pls_grid)
 
     return entries_grid, continuousscales_grid, merged_continuousscales
 end
 
-function compute_axes_grid(fig, s::OneOrMoreLayers;
+function compute_palettes(palettes)
+    layout = Dictionary((layout=wrap,))
+    theme_palettes = map(to_value, Dictionary(Makie.current_default_theme()[:palette]))
+    user_palettes = Dictionary(palettes)
+    return foldl(merge!, (layout, theme_palettes, user_palettes), init=NamedArguments())
+end
+
+function compute_axes_grid(fig, d::AbstractDrawable;
                            axis=NamedTuple(), palettes=NamedTuple())
 
-    axes_grid = compute_axes_grid(s; axis, palettes)
+    axes_grid = compute_axes_grid(d; axis, palettes)
     sz = size(axes_grid)
-    if sz !== (1, 1) && fig isa Axis
-        error("You can only pass an `Axis` to `draw!`, if the calculated layout only contains one element. Elements: $(sz)")
+    if sz != (1, 1) && fig isa Axis
+        msg = "You can only pass an `Axis` to `draw!` if the calculated layout only contains one element. Elements: $(sz)"
+        throw(ArgumentError(msg))
     end
 
     return map(ae -> AxisEntries(ae, fig), axes_grid)
 end
 
-function compute_axes_grid(s::OneOrMoreLayers;
+function compute_axes_grid(d::AbstractDrawable;
                            axis=NamedTuple(), palettes=NamedTuple())
-    layers::Layers = s
-    processedlayers = map(ProcessedLayer, layers)
+    palettes = compute_palettes(palettes)
 
-    theme_palettes = NamedTuple(Makie.current_default_theme()[:palette])
-    palettes = merge((layout=wrap,), map(to_value, theme_palettes), palettes)
-
+    processedlayers = ProcessedLayers(d).layers
     categoricalscales = MixedArguments()
     for processedlayer in processedlayers
         mergewith!(
@@ -129,7 +125,7 @@ function compute_axes_grid(s::OneOrMoreLayers;
 
     pls_grid = compute_processedlayers_grid(processedlayers, categoricalscales)
     entries_grid, continuousscales_grid, merged_continuousscales =
-        compute_entries_continuousscales(pls_grid)
+        compute_entries_continuousscales(pls_grid, categoricalscales)
 
     indices = CartesianIndices(pls_grid)
     axes_grid = map(indices) do c

@@ -1,6 +1,6 @@
 # Recipes
 
 ```@docs
-linesfill!
+choropleth
 linesfill
 ```

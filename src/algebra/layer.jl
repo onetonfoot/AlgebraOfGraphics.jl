@@ -1,4 +1,18 @@
 """
+    AbstractDrawable
+
+Abstract type encoding objects that can be drawn via [`AlgebraOfGraphics.draw`](@ref).
+"""
+abstract type AbstractDrawable end
+
+"""
+    AbstractAlgebraic  <: AbstractDrawable
+
+Abstract type encoding objects that can be combined together using `+` and `*`.
+"""
+abstract type AbstractAlgebraic <: AbstractDrawable end
+
+"""
     Layer(transformation, data, positional::AbstractVector, named::AbstractDictionary)
 
 Algebraic object encoding a single layer of a visualization. It is composed of a dataset,
@@ -6,7 +20,7 @@ positional and named arguments, as well as a transformation to be applied to tho
 `Layer` objects can be multiplied, yielding a novel `Layer` object, or added,
 yielding a [`AlgebraOfGraphics.Layers`](@ref) object.
 """
-Base.@kwdef struct Layer
+Base.@kwdef struct Layer <: AbstractAlgebraic
     transformation::Any=identity
     data::Any=nothing
     positional::Arguments=Arguments()
@@ -21,18 +35,18 @@ mapping(args...; kwargs...) = Layer(positional=collect(Any, args), named=NamedAr
 
 ⨟(f, g) = f === identity ? g : g === identity ? f : g ∘ f
 
-function Base.:*(l1::Layer, l2::Layer)
-    transformation = l1.transformation ⨟ l2.transformation
-    data = isnothing(l2.data) ? l1.data : l2.data
-    positional = vcat(l1.positional, l2.positional)
-    named = merge(l1.named, l2.named)
+function Base.:*(l::Layer, l′::Layer)
+    transformation = l.transformation ⨟ l′.transformation
+    data = isnothing(l′.data) ? l.data : l′.data
+    positional = vcat(l.positional, l′.positional)
+    named = merge(l.named, l′.named)
     return Layer(; transformation, data, positional, named)
 end
 
 ## Format for layer after processing
 
-Base.@kwdef struct ProcessedLayer
-    plottype::PlotFunc=Any
+Base.@kwdef struct ProcessedLayer <: AbstractDrawable
+    plottype::PlotType=Plot{plot}
     primary::NamedArguments=NamedArguments()
     positional::Arguments=Arguments()
     named::NamedArguments=NamedArguments()
@@ -55,14 +69,14 @@ end
 """
     ProcessedLayer(layer::Layer)
 
-Convert `layer` to equivalent processed layer.
+Output of processing a `layer`. A `ProcessedLayer` encodes
+- plot type,
+- grouping arguments,
+- positional and named arguments for the plot,
+- labeling information,
+- visual attributes.
 """
-function ProcessedLayer(layer::Layer)
-    processedlayer = process_mappings(layer)
-    grouped_entry = isnothing(layer.data) ? processedlayer : group(processedlayer)
-    primary = map(vs -> map(getuniquevalue, vs), grouped_entry.primary)
-    return layer.transformation(ProcessedLayer(grouped_entry; primary))
-end
+ProcessedLayer(layer::Layer) = process(layer)
 
 unnest(vs::AbstractArray, indices) = map(k -> [el[k] for el in vs], indices)
 
@@ -90,21 +104,24 @@ end
 
 ## Get scales from a `ProcessedLayer`
 
-uniquevalues(v::ArrayLike) = collect(uniquesorted(vec(v)))
+uniquevalues(v::AbstractArray) = collect(uniquesorted(vec(v)))
 
 to_label(label::AbstractString) = label
-to_label(labels::ArrayLike) = reduce(mergelabels, labels)
+to_label(labels::AbstractArray) = reduce(mergelabels, labels)
 
 function categoricalscales(processedlayer::ProcessedLayer, palettes)
     categoricals = MixedArguments()
     merge!(categoricals, processedlayer.primary)
-    merge!(categoricals, Dictionary(filter(iscategoricalcontainer, processedlayer.positional)))
-    return map(keys(categoricals), categoricals) do key, val
+    merge!(categoricals, filter(iscategoricalcontainer, Dictionary(processedlayer.positional)))
+
+    categoricalscales = similar(keys(categoricals), CategoricalScale)
+    map!(categoricalscales, keys(categoricals), categoricals) do key, val
         palette = key isa Integer ? automatic : get(palettes, key, automatic)
         datavalues = key isa Integer ? mapreduce(uniquevalues, mergesorted, val) : uniquevalues(val)
         label = to_label(get(processedlayer.labels, key, ""))
         return CategoricalScale(datavalues, palette, label)
     end
+    return categoricalscales
 end
 
 function has_zcolor(pl::ProcessedLayer)
@@ -118,18 +135,27 @@ end
 function continuousscales(processedlayer::ProcessedLayer)
     continuous = MixedArguments()
     merge!(continuous, filter(iscontinuous, processedlayer.named))
-    merge!(continuous, Dictionary(filter(iscontinuous, processedlayer.positional)))
+    merge!(continuous, filter(iscontinuous, Dictionary(processedlayer.positional)))
 
-    continuousscales = map(keys(continuous), continuous) do key, val
-        extrema = Makie.extrema_nan(val)
+    continuousscales = similar(keys(continuous), ContinuousScale)
+    map!(continuousscales, keys(continuous), continuous) do key, val
+        extrema = extrema_finite(val)
         label = to_label(get(processedlayer.labels, key, ""))
         return ContinuousScale(extrema, label)
     end
+
     # TODO: also encode colormap here
     if has_zcolor(processedlayer) && !haskey(continuousscales, :color)
         colorscale = get(continuousscales, 3, nothing)
         isnothing(colorscale) || insert!(continuousscales, :color, colorscale)
     end
+
+    colorrange = get(processedlayer.attributes, :colorrange, nothing)
+    if !isnothing(colorrange)
+        manualcolorscale = ContinuousScale(colorrange, "", force=true)
+        merge!(mergescales, continuousscales, Dictionary((color=manualcolorscale,)))
+    end
+
     return continuousscales
 end
 
@@ -179,6 +205,8 @@ function mergeable(processedlayer::ProcessedLayer)
     plottype <: Violin && return true
     # merge stacked barplots
     plottype <: BarPlot && haskey(primary, :stack) && return true
+    # merge waterfall plots
+    plottype <: Waterfall && return true
     # do not merge by default
     return false
 end
@@ -216,4 +244,62 @@ function append_processedlayers!(pls_grid, processedlayer::ProcessedLayer, categ
         end
     end
     return pls_grid
+end
+
+## Attribute processing
+
+"""
+    compute_attributes(pl::ProcessedLayer, categoricalscales, continuousscales_grid, continuousscales)
+
+Process attributes of a `ProcessedLayer`. In particular,
+- remove AlgebraOfGraphics-specific layout attributes,
+- opt out of Makie cycling mechanism,
+- customize behavior of `color` (implementing `alpha` transparency),
+- customize behavior of bar `width` (default to one unit when not specified),
+- set correct `colorrange`.
+Return computed attributes.
+"""
+function compute_attributes(pl::ProcessedLayer,
+                            categoricalscales::MixedArguments,
+                            continuousscales_grid::AbstractMatrix,
+                            continuousscales::MixedArguments)
+    plottype, primary, named, attributes = pl.plottype, pl.primary, pl.named, pl.attributes
+
+    attrs = NamedArguments()
+    merge!(attrs, attributes)
+    merge!(attrs, primary)
+    merge!(attrs, named)
+
+    # implement alpha transparency
+    alpha = get(attrs, :alpha, automatic)
+    color = get(attrs, :color, automatic)
+    (color !== automatic) && (alpha !== automatic) && (color = (color, alpha))
+
+    # opt out of the default cycling mechanism
+    cycle = nothing
+
+    merge!(attrs, Dictionary(valid_options(; color, cycle)))
+
+    # avoid automatic bar width computation in Makie (issue #277)
+    # sensible default for dates (isse #369)
+    # TODO: consider only doing this for categorical scales or dates
+    if (plottype <: Union{BarPlot, BoxPlot, CrossBar, Violin}) && !haskey(attrs, :width)
+        xscale = get(continuousscales, 1, nothing)
+        width = if isnothing(xscale)
+            1
+        else
+            min, max = xscale.extrema
+            elementwise_rescale(oneunit(max - min))
+        end
+        insert!(attrs, :width, width)
+    end
+
+    # Match colorrange extrema
+    # TODO: might need to change to support temporal color scale
+    # TODO: maybe use plottype to infer whether this should be passed or not
+    colorscale = get(continuousscales, :color, nothing)
+    !isnothing(colorscale) && set!(attrs, :colorrange, colorscale.extrema)
+
+    # remove unnecessary information 
+    return filterkeys(!in((:col, :row, :layout, :alpha)), attrs)
 end
